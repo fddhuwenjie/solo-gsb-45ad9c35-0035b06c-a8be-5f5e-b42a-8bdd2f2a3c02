@@ -180,15 +180,21 @@ CREATE TABLE IF NOT EXISTS redemption_quotas (
 );
 
 -- 短时额度预留：为一次单链访问预先占一份额度（有效秒数 1～300，到期自动释放）。
--- reservation_key 全局唯一（仅有效预留占用；过期 / 转为核销后键即释放）；
--- 同一链内同一令牌至多一行——即同一令牌只能有一笔有效预留（过期行由应用层
--- 惰性清除后允许新预留）。预留不单独记已用：核销成功时同事务删除预留行，
--- 由 redemptions 计入已用量，份额从“预留”转为“已用”，可用量不变。
+-- 成功预留只追加、永不删除：state 记录其生命周期——
+--   active  = 尚未到期且未核销（占额度份额、占用末端令牌）；
+--   expired = 已到期（在写事务内惰性标记；份额与令牌均已释放，仅留历史供同键重放）；
+--   redeemed= 已被携带同键的单链核销转为已用（份额随 redemptions 计入已用；仅留历史）。
+-- reservation_key 跨所有状态全局唯一：成功预留永久关联首次内容与首次响应，
+-- 同键同内容即使已过期 / 已核销也只能回放首次结果，同键换内容一律 409。
+-- 同一链内同一令牌至多一笔 state='active' 的预留（部分唯一索引）：
+-- 过期 / 核销后旧行保留但不再占令牌，新键（或同键的首次历史已释放后）可重新预留。
+-- 预留不单独记已用：核销成功时同事务把 state 置为 redeemed，由 redemptions 计入
+-- 已用量，份额从“预留”转为“已用”，可用量不变。
 CREATE TABLE IF NOT EXISTS reservations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_id        TEXT NOT NULL,
     token_id        TEXT NOT NULL,
-    reservation_key TEXT NOT NULL UNIQUE,
+    reservation_key TEXT NOT NULL,
     subject         TEXT NOT NULL,
     request_path    TEXT NOT NULL,
     method          TEXT NOT NULL,
@@ -198,9 +204,22 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_at      TEXT NOT NULL,
     expires_at      TEXT NOT NULL,
     result_json     TEXT NOT NULL,
-    UNIQUE (chain_id, token_id),
+    state           TEXT NOT NULL DEFAULT 'active'
+                    CHECK (state IN ('active', 'expired', 'redeemed')),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
+"""
+
+# 预留表的唯一索引依赖 state 列：旧库的 reservations 没有 state 列，必须先执行
+# _migrate_reservations 再建索引（否则部分索引会因列不存在而失败）。
+RESERVATION_INDEXES_SQL = """
+-- reservation_key 全局唯一（跨全部状态：成功预留的键永久关联首次内容）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_key
+ON reservations (reservation_key);
+
+-- 同一令牌至多一笔有效（active）预留；expired / redeemed 历史行不占令牌
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_active_token
+ON reservations (chain_id, token_id) WHERE state = 'active';
 """
 
 DEMO_PRINCIPALS = {
@@ -252,6 +271,9 @@ def get_db() -> Iterator[sqlite3.Connection]:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _migrate_principals(conn)
+    _migrate_reservations(conn)
+    # 预留表 state 列已就绪（新库建表自带、旧库刚迁移）后再建其唯一索引
+    conn.executescript(RESERVATION_INDEXES_SQL)
     if settings.seed_demo_principals:
         conn.executemany(
             "INSERT OR IGNORE INTO principals (name, hmac_secret) VALUES (?, ?)",
@@ -269,6 +291,60 @@ def _migrate_principals(conn: sqlite3.Connection) -> None:
             "ALTER TABLE principals "
             "ADD COLUMN current_generation INTEGER NOT NULL DEFAULT 1"
         )
+
+
+def _migrate_reservations(conn: sqlite3.Connection) -> None:
+    """把旧版 reservations（无 state 列、(chain_id, token_id) 全表唯一）迁移到
+    生命周期模型，**保留全部旧记录**。
+
+    旧表中尚未到期的行归一为 ``active``（继续占份额与令牌）；已到期行归一为
+    ``expired``（份额与令牌已释放，仅保留历史供同键重放）。迁移用 SQLite 改表
+    标准流程（建新表 → 按到期时刻搬数据 → 删旧表 → 改名）：旧的全表唯一约束随之
+    替换为“仅 active 行唯一”的部分索引，同一令牌的过期 / 核销历史可与新预留并存。
+    新库（建表时已含 state 列）直接跳过。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "state" in cols:
+        return
+    # 服务端生成的 UTC ISO 字面量（非用户输入），用于 expires_at 的字典序比较
+    now_literal = datetime.now(timezone.utc).isoformat().replace("'", "''")
+    conn.executescript(
+        f"""
+CREATE TABLE reservations_new (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id        TEXT NOT NULL,
+    token_id        TEXT NOT NULL,
+    reservation_key TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    request_path    TEXT NOT NULL,
+    method          TEXT NOT NULL,
+    source_ip       TEXT,
+    request_body    TEXT,
+    content_sha256  TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    result_json     TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'active'
+                    CHECK (state IN ('active', 'expired', 'redeemed')),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
+INSERT INTO reservations_new
+    (id, chain_id, token_id, reservation_key, subject, request_path, method,
+     source_ip, request_body, content_sha256, created_at, expires_at, result_json, state)
+SELECT id, chain_id, token_id, reservation_key, subject, request_path, method,
+       source_ip, request_body, content_sha256, created_at, expires_at, result_json,
+       CASE WHEN expires_at > '{now_literal}' THEN 'active' ELSE 'expired' END
+FROM reservations;
+
+DROP TABLE reservations;
+ALTER TABLE reservations_new RENAME TO reservations;
+
+CREATE UNIQUE INDEX idx_reservations_key ON reservations (reservation_key);
+CREATE UNIQUE INDEX idx_reservations_active_token
+ON reservations (chain_id, token_id) WHERE state = 'active';
+        """
+    )
 
 
 def _backfill_key_tables(conn: sqlite3.Connection) -> None:
@@ -1102,9 +1178,10 @@ def get_quota_status(
 ) -> QuotaStatus:
     """组装主体的额度口径（额度 / 已用量 / 有效预留 / 可用量）。
 
-    ``reserved`` 只统计 ``expires_at`` 晚于 ``at``（缺省为当前时刻）的预留——
-    过期预留自动释放，不再占份额；``available = limit - used - reserved``
-    （未设置额度时 ``limit`` / ``remaining`` / ``available`` 均为 None）。
+    ``reserved`` 只统计 ``state='active'`` 且 ``expires_at`` 晚于 ``at``（缺省为
+    当前时刻）的预留——到期 / 已核销预留都不占份额（历史行保留供同键重放）；
+    ``available = limit - used - reserved``（未设置额度时 ``limit`` /
+    ``remaining`` / ``available`` 均为 None）。
     """
     row = load_quota_row(conn, subject)
     limit = row[0] if row is not None else None
@@ -1148,7 +1225,7 @@ def upsert_quota(
 
 
 # --------------------------------------------------------------------------- #
-# 短时额度预留（成功预留才落库；过期自动释放，核销成功后转为已用删除）
+# 短时额度预留（成功预留只追加；到期 / 核销仅改 state，历史永久保留供同键重放）
 # --------------------------------------------------------------------------- #
 _RESERVATION_COLUMNS = (
     "chain_id, token_id, reservation_key, subject, request_path, method, "
@@ -1161,11 +1238,12 @@ def load_reservation_by_key(
 ) -> tuple[ReservationEvent, str] | None:
     """返回（预留事件, 首次响应 JSON）；未见过该 reservation_key 时返回 None。
 
-    调用方须自行按 ``expires_at`` 判定预留是否仍有效：过期预留视为已释放
-    （键与令牌都不再被占用），由写事务内的调用方惰性清除。
+    跨**全部状态**（active / expired / redeemed）查找：成功预留的键永久关联首次
+    内容与首次响应，同键同内容即使已过期 / 已核销也由调用方回放首次结果；
+    是否仍占份额 / 令牌由调用方按 ``state`` 与 ``expires_at`` 判定。
     """
     row = conn.execute(
-        f"SELECT {_RESERVATION_COLUMNS}, result_json FROM reservations "
+        f"SELECT {_RESERVATION_COLUMNS}, state, result_json FROM reservations "
         "WHERE reservation_key = ?",
         (reservation_key,),
     ).fetchone()
@@ -1177,13 +1255,14 @@ def load_reservation_by_key(
 def load_reservation_for_token(
     conn: sqlite3.Connection, chain_id: str, token_id: str
 ) -> ReservationEvent | None:
-    """该令牌当前的预留记录（同一令牌至多一行，即至多一笔有效预留）。
+    """该令牌当前**有效（active）**的预留记录；无 active 预留时返回 None。
 
-    不过滤过期：是否仍有效由调用方按 ``expires_at`` 判定（过期即视为释放）。
+    只查 ``state='active'``：过期 / 已核销的历史行不占用令牌；active 行是否已到
+    期仍由调用方按 ``expires_at`` 判定（到期即在写事务内惰性标记为 expired）。
     """
     row = conn.execute(
-        f"SELECT {_RESERVATION_COLUMNS} FROM reservations "
-        "WHERE chain_id = ? AND token_id = ?",
+        f"SELECT {_RESERVATION_COLUMNS}, state FROM reservations "
+        "WHERE chain_id = ? AND token_id = ? AND state = 'active'",
         (chain_id, token_id),
     ).fetchone()
     return _reservation_from_row(row) if row else None
@@ -1192,12 +1271,16 @@ def load_reservation_for_token(
 def insert_reservation(
     conn: sqlite3.Connection, event: ReservationEvent, result_json: str
 ) -> None:
-    """追加一条预留记录；唯一约束冲突时抛 sqlite3.IntegrityError。"""
+    """追加一条 state='active' 的预留记录；唯一约束冲突时抛 sqlite3.IntegrityError。
+
+    reservation_key 全局唯一（跨全部状态，故同键永远只能指向首次预留）；
+    (chain_id, token_id) 的部分唯一索引保证同一令牌至多一笔 active 预留。
+    """
     conn.execute(
         "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
         "request_path, method, source_ip, request_body, content_sha256, "
-        "created_at, expires_at, result_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_at, expires_at, result_json, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
         (
             event.chain_id,
             event.token_id,
@@ -1215,27 +1298,52 @@ def insert_reservation(
     )
 
 
-def delete_reservation(conn: sqlite3.Connection, reservation_key: str) -> None:
-    """删除一条预留（过期惰性释放，或核销成功后把份额转为已用）。"""
+def mark_reservation_expired(conn: sqlite3.Connection, reservation_key: str) -> None:
+    """把一笔已到期的 active 预留在写事务内标记为 expired（惰性释放）。
+
+    只更新仍为 active 的行：份额与令牌立即释放（有效预留计数与令牌查询都不再
+    命中），但行与首次响应永久保留，供同键同内容重放回放首次结果。
+    """
     conn.execute(
-        "DELETE FROM reservations WHERE reservation_key = ?", (reservation_key,)
+        "UPDATE reservations SET state = 'expired' "
+        "WHERE reservation_key = ? AND state = 'active'",
+        (reservation_key,),
+    )
+
+
+def mark_reservation_redeemed(conn: sqlite3.Connection, reservation_key: str) -> None:
+    """携键核销成功后在同一事务内把预留转为已用（active -> redeemed）。
+
+    行不删除：份额由 redemptions 计入已用（有效预留计数 -1、已用量 +1、可用量
+    不变），令牌此后由 redemptions 的已核销约束守护；预留历史与首次响应保留，
+    供同键同内容重放回放首次预留结果。
+    """
+    conn.execute(
+        "UPDATE reservations SET state = 'redeemed' "
+        "WHERE reservation_key = ? AND state = 'active'",
+        (reservation_key,),
     )
 
 
 def count_active_reservations(
     conn: sqlite3.Connection, subject: str, at: datetime | None = None
 ) -> int:
-    """某主体当前的有效预留数（``expires_at`` 晚于 ``at``；过期自动释放）。"""
+    """某主体当前的有效预留数（state='active' 且 ``expires_at`` 晚于 ``at``）。
+
+    过期 / 已核销行都不占份额。正常情况下 active 行在惰性释放前可能已过期，
+    故除 state 外仍须按时间过滤，保证到期立即释放。
+    """
     moment = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM reservations "
-        "WHERE subject = ? AND expires_at > ?",
+        "WHERE subject = ? AND state = 'active' AND expires_at > ?",
         (subject, moment.isoformat()),
     ).fetchone()
     return int(row["n"])
 
 
 def _reservation_from_row(row: sqlite3.Row) -> ReservationEvent:
+    keys = row.keys()
     return ReservationEvent(
         chain_id=row["chain_id"],
         token_id=row["token_id"],
@@ -1248,4 +1356,5 @@ def _reservation_from_row(row: sqlite3.Row) -> ReservationEvent:
         content_sha256=row["content_sha256"],
         created_at=datetime.fromisoformat(row["created_at"]),
         expires_at=datetime.fromisoformat(row["expires_at"]),
+        state=row["state"] if "state" in keys else "active",
     )

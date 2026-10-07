@@ -145,6 +145,16 @@ def _reservation_exists(reservation_key: str) -> bool:
         return row is not None
 
 
+def _reservation_state(reservation_key: str) -> str | None:
+    """返回预留行当前生命周期状态（active / expired / redeemed）；无行返回 None。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT state FROM reservations WHERE reservation_key = ?",
+            (reservation_key,),
+        ).fetchone()
+        return None if row is None else row["state"]
+
+
 # --------------------------------------------------------------------------- #
 # 预留：成功 / 重放 / 冲突 / 校验
 # --------------------------------------------------------------------------- #
@@ -353,7 +363,7 @@ def test_expired_reservation_releases_quota_token_and_key(client):
     assert _get_quota(client, s).json()["reserved"] == 1
 
 
-def test_expired_reservation_same_key_retried_as_new(client):
+def test_expired_reservation_same_key_same_content_replays_first_result(client):
     s = _subj("rsv")
     assert _set_quota(client, s, 1).status_code == 200
     cid, leaf = _chain_with_tip_subject(client, s)
@@ -362,12 +372,107 @@ def test_expired_reservation_same_key_retried_as_new(client):
 
     _expire_reservation("rsv-exp-key")
 
-    # 过期后同键同内容重试：按一笔全新预留处理（新的到期时间）
+    # 过期后同键同内容重试：键历史永久保留——回放首次结果（replayed=true、
+    # 首次到期时间），不重新判定、不顺延、不重新占额度
     again = _reserve(client, cid, leaf, "rsv-exp-key", ttl=1)
-    assert again.status_code == 201
+    assert again.status_code == 200
+    body = again.json()
+    assert body["replayed"] is True
+    assert body["reserved"] is True
+    assert body["expires_at"] == first.json()["expires_at"]
+    assert body["evaluated_at"] == first.json()["evaluated_at"]
+    # 重放不重新占份：过期释放后可用量已归还
+    got = _get_quota(client, s).json()
+    assert got["reserved"] == 0 and got["available"] == 1
+    # 原行保留为 expired（历史不删除）
+    assert _reservation_state("rsv-exp-key") == "expired"
+
+
+def test_expired_reservation_same_key_different_content_still_conflicts(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    assert _reserve(client, cid, leaf, "rsv-exp-conflict", ttl=1).status_code == 201
+
+    _expire_reservation("rsv-exp-conflict")
+
+    # 即使已过期，同键换内容（换路径）仍一律 409
+    resp = _reserve(client, cid, leaf, "rsv-exp-conflict",
+                    path="/files/reports/y")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reservation_key"] == "rsv-exp-conflict"
+    assert detail["existing_sha256"] != detail["received_sha256"]
+    # 冲突不占份；旧行仍保留
+    got = _get_quota(client, s).json()
+    assert got["reserved"] == 0 and got["available"] == 1
+    assert _reservation_exists("rsv-exp-conflict") is True
+
+    # 该令牌以新键重新预留时，旧行被惰性翻转为 expired（历史保留）
+    assert _reserve(client, cid, leaf, "rsv-exp-conflict-newkey").status_code == 201
+    assert _reservation_state("rsv-exp-conflict") == "expired"
+    assert _reservation_state("rsv-exp-conflict-newkey") == "active"
+
+
+def test_expired_reservation_new_key_can_reserve_again(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    assert _reserve(client, cid, leaf, "rsv-exp-old", ttl=1).status_code == 201
+
+    _expire_reservation("rsv-exp-old")
+
+    # 份额与令牌已释放：未核销的令牌用**新键**可重新预留，再次占一份
+    again = _reserve(client, cid, leaf, "rsv-exp-new", ttl=60)
+    assert again.status_code == 201, again.text
+    assert again.json()["reserved"] is True
     assert again.json()["replayed"] is False
-    assert again.json()["expires_at"] != first.json()["expires_at"]
     assert _get_quota(client, s).json()["reserved"] == 1
+    # 旧历史行保留，新行 active
+    assert _reservation_state("rsv-exp-old") == "expired"
+    assert _reservation_state("rsv-exp-new") == "active"
+
+
+def test_redeemed_reservation_key_replays_first_result(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    first = _reserve(client, cid, leaf, "rsv-done-key", body={"q": 1})
+    assert first.status_code == 201
+
+    # 携键核销成功：预留转为 redeemed（行保留），份额计入已用
+    redeem = _redeem(client, cid, leaf, "rsv-done-rk",
+                     reservation_key="rsv-done-key", body={"q": 1})
+    assert redeem.status_code == 201, redeem.text
+    assert _reservation_state("rsv-done-key") == "redeemed"
+    got = _get_quota(client, s).json()
+    assert got["used"] == 1 and got["reserved"] == 0
+
+    # 核销后再对预留接口同键同内容请求：仍回放首次预留结果（replayed=true、
+    # 首次到期时间），不重新占额度
+    replay = _reserve(client, cid, leaf, "rsv-done-key", body={"q": 1})
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["replayed"] is True
+    assert body["reserved"] is True
+    assert body["expires_at"] == first.json()["expires_at"]
+    after = _get_quota(client, s).json()
+    assert after["used"] == 1 and after["reserved"] == 0
+    assert _reservation_state("rsv-done-key") == "redeemed"
+
+
+def test_redeemed_reservation_same_key_different_content_conflicts(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    assert _reserve(client, cid, leaf, "rsv-done-conf").status_code == 201
+    assert _redeem(client, cid, leaf, "rsv-done-conf-rk",
+                   reservation_key="rsv-done-conf").status_code == 201
+
+    # 已核销后同键换内容仍 409
+    resp = _reserve(client, cid, leaf, "rsv-done-conf", method="POST")
+    assert resp.status_code == 409
+    assert _reservation_state("rsv-done-conf") == "redeemed"
 
 
 # --------------------------------------------------------------------------- #
@@ -524,8 +629,8 @@ def test_redeem_with_matching_reservation_converts_to_used(client):
 
     got = _get_quota(client, s).json()
     assert got["used"] == 1 and got["reserved"] == 0
-    # 预留行已删除（转为已用）
-    assert _reservation_exists("rsv-use-1") is False
+    # 预留行保留为 redeemed（转为已用，历史不删除以供同键重放）
+    assert _reservation_state("rsv-use-1") == "redeemed"
 
     # 成功核销同键重试：返回首次结果（replayed=true，口径与首次一致）
     replay = _redeem(client, cid, leaf, "rsv-use-rk", reservation_key="rsv-use-1",
@@ -718,3 +823,150 @@ def test_concurrent_reserve_and_redeem_never_overshoot(client):
     got = _get_quota(client, s).json()
     assert got["used"] + got["reserved"] <= 1
     assert got["available"] == 1 - got["used"] - got["reserved"]
+
+
+# --------------------------------------------------------------------------- #
+# 旧库迁移：旧 reservations（无 state、(chain_id,token_id) 全表唯一）平滑升级，
+# 旧记录全部保留（未到期 -> active，已到期 -> expired）
+# --------------------------------------------------------------------------- #
+def test_legacy_reservations_table_migrates_preserving_rows():
+    import os
+    import sqlite3
+    import tempfile
+
+    from app.database import connect, init_db
+    from app.security import sha256_hex
+
+    db_path = os.path.join(tempfile.mkdtemp(prefix="cap-chain-migrate-"), "legacy.db")
+    now = datetime.now(timezone.utc)
+    future = (now + timedelta(seconds=60)).isoformat()
+    past = (now - timedelta(seconds=60)).isoformat()
+    created = now.isoformat()
+
+    # 手工建旧版 reservations（无 state 列；reservation_key 与 (chain_id,token_id)
+    # 各带全表唯一约束），并写入一笔未到期、一笔已到期的历史
+    raw = sqlite3.connect(db_path)
+    raw.execute("CREATE TABLE chains (chain_id TEXT PRIMARY KEY)")
+    raw.execute("INSERT INTO chains (chain_id) VALUES ('legacy-chain')")
+    raw.execute(
+        """
+CREATE TABLE reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    reservation_key TEXT NOT NULL UNIQUE,
+    subject TEXT NOT NULL,
+    request_path TEXT NOT NULL,
+    method TEXT NOT NULL,
+    source_ip TEXT,
+    request_body TEXT,
+    content_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    UNIQUE (chain_id, token_id),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+)
+        """
+    )
+    raw.executemany(
+        "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
+        "request_path, method, source_ip, request_body, content_sha256, "
+        "created_at, expires_at, result_json) "
+        "VALUES ('legacy-chain', ?, ?, 'legacy-subj', '/x', 'GET', NULL, 'null', "
+        "?, ?, ?, '{}')",
+        [
+            ("legacy-live", "legacy-key-live", sha256_hex(b"live"), created, future),
+            ("legacy-dead", "legacy-key-dead", sha256_hex(b"dead"), created, past),
+        ],
+    )
+    raw.commit()
+    raw.close()
+
+    # 触发预留表迁移（init_db 的其余回填依赖完整库，本用例只验证预留迁移本身）
+    from app.database import RESERVATION_INDEXES_SQL, _migrate_reservations
+
+    conn = connect(db_path)
+    _migrate_reservations(conn)
+    conn.executescript(RESERVATION_INDEXES_SQL)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(reservations)")}
+    assert "state" in cols
+    states = {
+        r["reservation_key"]: r["state"]
+        for r in conn.execute(
+            "SELECT reservation_key, state FROM reservations"
+        ).fetchall()
+    }
+    assert states == {"legacy-key-live": "active", "legacy-key-dead": "expired"}
+
+    # 部分唯一索引：expired 历史不阻止同令牌以新键再占一笔 active
+    conn.execute(
+        "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
+        "request_path, method, source_ip, request_body, content_sha256, "
+        "created_at, expires_at, result_json, state) "
+        "VALUES ('legacy-chain', 'legacy-dead', 'legacy-key-again', 'legacy-subj', "
+        "'/x', 'GET', NULL, 'null', ?, ?, ?, '{}', 'active')",
+        (sha256_hex(b"again"), created, future),
+    )
+    # 同键全局唯一仍生效（跨状态）
+    import sqlite3 as _sq
+    try:
+        conn.execute(
+            "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
+            "request_path, method, source_ip, request_body, content_sha256, "
+            "created_at, expires_at, result_json, state) "
+            "VALUES ('legacy-chain', 'other-token', 'legacy-key-live', 'legacy-subj', "
+            "'/x', 'GET', NULL, 'null', ?, ?, ?, '{}', 'active')",
+            (sha256_hex(b"dup"), created, future),
+        )
+        raise AssertionError("reservation_key 跨状态唯一约束应拦截重复键")
+    except _sq.IntegrityError:
+        pass
+    conn.commit()
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 并发：到期释放与同键重放 / 新预留交错时不能双占额度
+# --------------------------------------------------------------------------- #
+def test_concurrent_expiry_release_and_new_reserve_never_double_occupy(client):
+    # 额度 1：旧预留到期瞬间，同键重放（不占份）与另一令牌新预留并发，
+    # 合计占用不得超过 1。
+    s = _subj("rsv-exp-conc")
+    assert _set_quota(client, s, 1).status_code == 200
+    c1, l1 = _chain_with_tip_subject(client, s)
+    c2, l2 = _chain_with_tip_subject(client, s)
+    assert _reserve(client, c1, l1, "rsv-exp-conc-old", ttl=1).status_code == 201
+    _expire_reservation("rsv-exp-conc-old")
+
+    outcomes: list[tuple[str, int]] = []
+    barrier = threading.Barrier(2)
+
+    def replay_worker() -> None:
+        # 同键同内容：只回放首次结果，任何情况下都不占份
+        barrier.wait()
+        resp = _reserve(client, c1, l1, "rsv-exp-conc-old", ttl=1)
+        outcomes.append(("replay", resp.status_code))
+
+    def new_reserve_worker() -> None:
+        barrier.wait()
+        resp = _reserve(client, c2, l2, "rsv-exp-conc-new")
+        outcomes.append(("new", resp.status_code))
+
+    threads = [threading.Thread(target=replay_worker),
+               threading.Thread(target=new_reserve_worker)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    replay_code = dict(outcomes)["replay"]
+    new_code = dict(outcomes)["new"]
+    assert replay_code == 200  # 重放成功（replayed=true）
+    assert new_code == 201     # 释放出的份额被新预留取得
+    got = _get_quota(client, s).json()
+    assert got["reserved"] == 1 and got["available"] == 0
+    # 同键重放未插入新行：旧键仍是 expired 历史
+    assert _reservation_state("rsv-exp-conc-old") == "expired"
+    assert _reservation_state("rsv-exp-conc-new") == "active"
