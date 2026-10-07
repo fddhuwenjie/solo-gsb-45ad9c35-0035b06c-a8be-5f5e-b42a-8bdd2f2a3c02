@@ -50,12 +50,17 @@
 14. **短时额度预留** —— 为一次单链访问预先**占一份额度**（有效秒数 1～300，
     到期自动释放）：提交 `chain_id`、末端 `token_id`、路径、方法、来源 IP、请求体、
     预留键与有效秒数，仅在**主体已设额度、授权允许、令牌未核销且可用量充足**时
-    占一份并返回到期时间。同键同内容重放原预留，换内容冲突，失败不占键；
-    **同一令牌只能有一笔有效预留**。额度查询区分**历史已用 / 有效预留 / 可用量**
+    占一份并返回到期时间。**成功预留的 `reservation_key` 永久关联首次内容与首次
+    响应**：同键同内容始终返回首次结果与首次到期时间（`replayed=true`），即使预留
+    已到期或已被核销也不新建预留、不刷新到期、不再占额度；同键换内容一律 `409`
+    （到期 / 核销也不例外）；失败不占键。到期或核销只释放**份额与令牌占用**
+    （历史记录保留为 `expired` / `consumed`）——**同一令牌同时至多一笔有效预留**，
+    释放后的令牌可用**新键**再次预留。额度查询区分**历史已用 / 有效预留 / 可用量**
     （`available = limit - used - reserved`）；普通单链核销与会签**不得占用**
-    预留份额与被预留的令牌，调低额度不得侵占预留，过期自动释放。
-    单链核销可携带预留键：链、令牌与访问内容匹配且未过期时才使用该份额，
-    并重新检查验签 / 撤销 / 密钥停用 / 权限，成功则在同一事务内把预留转为已用。
+    预留份额与被预留的令牌，调低额度不得侵占预留，过期自动释放份额。
+    单链核销可携带预留键：链、令牌与访问内容匹配且预留有效时才使用该份额，
+    并重新检查验签 / 撤销 / 密钥停用 / 权限，成功则在同一事务内把预留转为已用
+    （记录保留，供预留键之后重放首次结果）。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -179,8 +184,8 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 | 字段              | 必填 | 说明                                              |
 | ----------------- | ---- | ------------------------------------------------- |
 | `token_id`        | 是   | 预留针对的令牌；**必须为链末端**                  |
-| `reservation_key` | 是   | 客户端幂等键；同键内容必须一致（仅有效预留占用）  |
-| `ttl_seconds`     | 是   | 预留有效秒数，**1～300**；到期自动释放            |
+| `reservation_key` | 是   | 客户端幂等键；成功预留后**永久关联首次内容**——同键只能重放首次结果，换内容 `409`（到期 / 核销后亦然） |
+| `ttl_seconds`     | 是   | 预留有效秒数，**1～300**；到期释放份额与令牌占用（历史保留），不影响同键重放 |
 | `request_path`    | 是   | 计划访问的资源路径（核销时须一致）                |
 | `method`          | 是   | 计划使用的 HTTP 方法（大小写不敏感）              |
 | `source_ip`       | 否   | 计划访问的来源 IP（核销时须一致）                 |
@@ -626,16 +631,23 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
    （`limit - used - reserved`）充足**时占一份，返回 `201` 与到期时间
    `expires_at`（= 接收时刻 + `ttl_seconds`）；
 3. **同一令牌只能有一笔有效预留**：该令牌已持有未过期预留时返回 `409`
-   （响应给出已有预留的 `existing_reservation_key` 与 `expires_at`）；
-4. 同 `reservation_key` 同内容重放返回**首次预留结果**（`200`、
-   `replayed=true`、到期时间与首次一致，不重复占份）；同键换内容
-   （含换 `ttl_seconds`）返回 `409`；
+   （响应给出已有预留的 `existing_reservation_key` 与 `expires_at`）；到期或
+   核销只释放令牌占用，之后可用**新键**再次预留（历史行不冲突，由部分唯一
+   索引保证同一令牌至多一条 `active` 记录）；
+4. 成功预留的 `reservation_key` **永久关联首次内容与首次响应**：同键同内容
+   无论预留是否已到期 / 已核销，都返回首次预留结果（`200`、`replayed=true`、
+   **首次到期时间**、首次额度口径，不重新判定、不刷新到期、不再占额度）；
+   同键换内容（含换 `ttl_seconds`）**一律** `409`（响应附预留当前状态
+   `reservation_status`：`active` / `expired` / `consumed`）；
 5. **失败不占键**：判定拒绝（`decision="deny"`）、主体未设额度
    （`deny_reason="quota_unset"`）或可用量不足
    （`deny_reason="quota_exhausted"`）均返回 `200` + `reserved=false`，
    `reservation_key` 未被占用，条件满足后同键重试即可成功；
-6. **过期自动释放**：到期后预留不再占额度、不再占用令牌与预留键——
-   同一令牌可重新预留，同键重试按一笔全新预留处理（新的到期时间）。
+6. **到期只释放份额与令牌占用，不丢预留历史**：到期后预留不再占额度、不再
+   占用令牌——同一令牌可用**新键**重新预留；但旧键记录保留（状态置
+   `expired`），用旧键同内容重试是**重放首次结果**（不会新建预留、不会刷新
+   到期时间、不会再次占额度）。核销成功同理：预留记录置 `consumed` 永久保留，
+   其键只能重放、不能再次核销占额。
 
 ```bash
 curl -sS -X POST http://localhost:8000/api/v1/chains/quota-demo-2/reservations \
@@ -684,11 +696,11 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/quota-demo-2/reservations \
 | 情况 | 状态码 | 响应要点 |
 | ---- | ------ | -------- |
 | 首次且末端 + 允许 + 已设额度 + 可用量充足 | `201` | `reserved=true`、`expires_at`；`quota` 为占用一份后的口径 |
-| 同 `reservation_key` 同内容重试（未过期） | `200` | `replayed=true`，回放首次结果（到期时间一致，不重复占份） |
+| 同 `reservation_key` 同内容重试（未过期 / **已到期 / 已核销均同**） | `200` | `replayed=true`，回放首次结果（**首次到期时间**、首次额度口径；不刷新、不重复占份） |
 | 末端且授权允许，但未设额度 | `200` | `reserved=false`、`deny_reason="quota_unset"`；不占键 |
 | 末端且授权允许，但可用量不足 | `200` | `reserved=false`、`deny_reason="quota_exhausted"`；不占键 |
 | 末端但授权 / 撤销 / 停用判定拒绝 | `200` | `reserved=false`、`decision="deny"`、完整轨迹；不占键 |
-| 同 `reservation_key` 换内容（未过期） | `409` | 给出双方 `existing_sha256` / `received_sha256` |
+| 同 `reservation_key` 换内容（**任何状态，含已到期 / 已核销**） | `409` | 给出双方 `existing_sha256` / `received_sha256` 与 `reservation_status` |
 | 目标非链末端 | `409` | 附 `chain_tip_token_id` |
 | 令牌已核销 | `409` | 附 `existing_request_key` |
 | 令牌已持有另一键的有效预留 | `409` | 附 `existing_reservation_key` 与 `expires_at` |
@@ -696,9 +708,11 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/quota-demo-2/reservations \
 | `ttl_seconds` 超出 1～300 等 | `422` | Pydantic 校验错误 |
 
 > 预留与核销 / 会签 / 额度调整同以 `BEGIN IMMEDIATE` 串行化：并发预留不会
-> 超发可用量。预留的份额只能由**携带同一预留键、同访问内容的单链核销**转为
-> 已用（见下节）；普通核销与会签既不得占用被预留的令牌，也不得使用预留的
-> 份额（它们的可用量均不含 `reserved` 部分）。过期预留自动释放全部占用。
+> 超发可用量，到期释放与同键重放并发也不会双占份额（重放永远只回放、不占份，
+> 份额只可能被新键预留或核销占用）。预留的份额只能由**携带同一预留键、同访问
+> 内容的单链核销**转为已用（见下节）；普通核销与会签既不得占用被预留的令牌，
+> 也不得使用预留的份额（它们的可用量均不含 `reserved` 部分）。到期 / 核销释放
+> 份额与令牌占用，但预留记录与键历史永久保留（`expired` / `consumed`）。
 > 对应回归测试见 `tests/test_reservation.py`。
 
 ---
@@ -719,14 +733,16 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/quota-demo-2/reservations \
 5. 目标不是链末端，或判定为 `deny` 时，**既不核销，也不占用 `request_key`**——
    后续有效请求仍可尝试，同一 `request_key` 也还能用于一次成功核销；
 6. **短时额度预留**：请求体可携带 `reservation_key` 使用事先预留的份额——
-   仅当该令牌持有**同键、同访问内容**（路径 / 方法 / 来源 IP / 请求体）**且未过期**
-   的有效预留时才核销，成功后在**同一事务**内把预留转为已用（预留行删除、
-   已用量 +1，可用量不变；此时不再重复检查余额，但**仍重新检查**验签 / 撤销 /
-   密钥停用 / 权限）。预留键不存在 / 已过期 / 内容不符
+   仅当该令牌持有**同键、同访问内容**（路径 / 方法 / 来源 IP / 请求体）的
+   **有效预留**（未到期、未核销）时才核销，成功后在**同一事务**内把预留转为
+   已用（预留记录保留并置 `consumed`、已用量 +1，可用量不变；此时不再重复检查
+   余额，但**仍重新检查**验签 / 撤销 / 密钥停用 / 权限）。预留键不存在 / 指向
+   已到期或已核销的历史预留 / 内容不符
    （`deny_reason="reservation_mismatch"`）或授权重新判定拒绝时，**不核销、
    不占用 `request_key`、不计已用**（未过期的预留仍保留）。不带预留键的普通
    核销**不得占用被预留的令牌**（`deny_reason="token_reserved"`），其余额检查
    使用可用量 `available = limit - used - reserved`，同样不含他人预留的份额。
+   核销后原 `reservation_key` 只能在预留接口重放首次结果，不能再次核销占额。
 
 ```bash
 curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/redeem \
@@ -784,7 +800,7 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/redeem \
 | 末端且授权允许，但可用量用尽 | `200` | `redeemed=false`、`decision="allow"`、`deny_reason="quota_exhausted"`；不核销、不占键 |
 | 末端但授权 / 撤销 / 停用判定拒绝 | `200` | `redeemed=false`、`decision="deny"`、完整轨迹；不查余额、不核销、不占键 |
 | 令牌被他人预留，普通核销不带预留键 | `200` | `redeemed=false`、`deny_reason="token_reserved"`；不占键、不计已用 |
-| 预留键不存在 / 已过期 / 访问内容不符 | `200` | `redeemed=false`、`deny_reason="reservation_mismatch"`；不占键、不计已用 |
+| 预留键不存在 / 已到期 / 已核销 / 访问内容不符 | `200` | `redeemed=false`、`deny_reason="reservation_mismatch"`；不占键、不计已用 |
 | 同 `request_key` 换内容 | `409` | 给出双方 `existing_sha256` / `received_sha256` |
 | 目标非链末端 | `409` | 附 `chain_tip_token_id`（结构异常无法确定时为 `null`） |
 | 令牌此前已核销（含并发输家） | `409` | 附 `existing_request_key` 与赢家 `redeemed_at` |
@@ -1752,7 +1768,8 @@ curl -sS http://localhost:8000/api/v1/subjects/bob/redemption-quota
 
 下面演练：给主体 `alice` 设置总额度 1 → 预留一份额度（返回 `expires_at`）→
 额度查询区分已用 / 预留 / 可用 → 普通核销不得占用被预留的令牌 → 携带预留键、
-同访问内容的核销成功并把预留转为已用 → 同键重试回放首次结果 → 过期自动释放。
+同访问内容的核销成功并把预留转为已用（记录保留）→ 核销键与预留键分别重放首次
+结果 → 到期释放份额（记录保留，同键只重放、不占份，新键可重新预留）。
 前提同 [密钥轮换演练](#密钥轮换演练轮换前后签名求值与核销)：服务运行在
 `http://localhost:8000`，仓库根目录，本地 Python 3.10+，演示主体已播种。
 
@@ -1841,6 +1858,7 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-1/redeem \
 # → 200，"redeemed": false, "deny_reason": "reservation_mismatch"
 
 # 6) 携带预留键、同访问内容：核销成功，同一事务内预留转为已用
+#    （预留记录保留为 consumed，不再占份额，仅供预留键重放首次结果）
 curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-1/redeem \
   -H 'Content-Type: application/json' \
   -d '{"token_id":"rsv-demo-1-leaf","request_key":"rsv-access-1",
@@ -1849,13 +1867,20 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-1/redeem \
 # → 201，"redeemed": true，
 #   "quota": {"limit":1,"used":1,"reserved":0,"remaining":0,"available":0,...}
 
-# 6b) 成功核销同键重试（request_key + 预留键一致）：回放首次结果
+# 6b) 成功核销同键重试（request_key + 预留键一致）：核销键重放首次结果
 curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-1/redeem \
   -H 'Content-Type: application/json' \
   -d '{"token_id":"rsv-demo-1-leaf","request_key":"rsv-access-1",
        "request_path":"/files/reports/a","method":"GET",
        "reservation_key":"rsv-0001"}'
 # → 200，"replayed": true，quota 与首次一致（used=1，不重复计数）
+
+# 6c) 核销后用同一 reservation_key 再调预留接口：回放首次预留结果（不重新占份）
+curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-1/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-demo-1-leaf","reservation_key":"rsv-0001",
+       "ttl_seconds":120,"request_path":"/files/reports/a","method":"GET"}'
+# → 200，"replayed": true，expires_at 与首次完全一致；reserved 不增加
 
 # 7) 调低额度不得侵占预留：先为 rsv-demo-2 预留一份（此前可用量已随核销用满，
 #    需先把额度调高到 2），再尝试调低到 1 -> 409（used=1 + reserved=1）
@@ -1871,8 +1896,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
   -H 'Content-Type: application/json' -d '{"limit": 1}'
 # → 409（1 < used 1 + reserved 1；调低到 2 不变，预留到期后才可调低）
 
-# 8) 过期自动释放：等 120 秒（或换 ttl_seconds=1 重做一次）后，
-#    预留不再占额度，rsv-demo-2 可直接普通核销
+# 8) 到期自动释放份额与令牌占用：等 120 秒（或换 ttl_seconds=1 重做一次）后，
+#    reserved 归零，rsv-demo-2 可直接普通核销，也可用新键重新预留
 sleep 125
 curl -sS http://localhost:8000/api/v1/subjects/alice/redemption-quota
 # → {"limit":2,"used":1,"reserved":0,"remaining":1,"available":1,...}
@@ -1881,6 +1906,147 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-demo-2/redeem \
   -d '{"token_id":"rsv-demo-2-leaf","request_key":"rsv-access-2",
        "request_path":"/files/reports/b","method":"GET"}'
 # → 201，"redeemed": true（第 4 步的 request_key 当时未占用，这里直接成功）
+```
+
+### 两种重放演练（到期重放 / 核销键重放，可直接复制执行）
+
+成功预留的 `reservation_key` **始终关联首次内容与首次响应**：预留到期或被核销后，
+同键同内容仍然重放首次结果（`200`、`replayed=true`、首次到期时间，不再占额度），
+同键换内容一律 `409`；到期 / 核销只释放份额与令牌占用，未核销的令牌可用**新键**
+预留。两段演练各自独立，均在上面的[短时额度预留演练](#短时额度预留演练可直接复制执行)
+已定义 `build_alice_chain` 助手的同一 shell 中执行；为避免与前文共享 `alice` 的
+已用量，演练一直接用额度充足的 `alice`（若已在前文用满，先把 `limit` 调高 1），
+演练二改用一条全新主体链（演示用自定义助手，末端主体 `carol`，额度 1）。
+
+**重放一：预留到期后，同键重放首次结果；令牌用新键重新预留**
+
+```bash
+# 准备：一条新链 + 至少 1 份可用额度（前文演练后 alice 可能已用满，
+# 把总额度调到 3 即可保证有 1 份可用；该调整幂等、可重复执行）
+build_alice_chain rsv-replay-exp > /tmp/rsv-replay-exp.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/rsv-replay-exp.json   # → 201
+curl -sS -X PUT http://localhost:8000/api/v1/subjects/alice/redemption-quota \
+  -H 'Content-Type: application/json' -d '{"limit": 3}'                  # available 至少为 1
+
+# 1) 预留一份，TTL=2 秒：201，记下首次 expires_at
+curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-replay-exp/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-exp-leaf","reservation_key":"rkey-exp-1",
+       "ttl_seconds":2,"request_path":"/files/reports/x","method":"GET"}'
+# → 201，"reserved": true，"quota": {"reserved": 1, ...}
+
+# 2) 等待到期：份额自动释放（reserved 归零），无需任何清理调用
+sleep 3
+curl -sS http://localhost:8000/api/v1/subjects/alice/redemption-quota
+# → "reserved": 0，"available": 恢复为释放前 +1
+
+# 3) 到期后用**同一把 reservation_key、同一内容**重试：重放首次结果
+curl -sS -i -X POST http://localhost:8000/api/v1/chains/rsv-replay-exp/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-exp-leaf","reservation_key":"rkey-exp-1",
+       "ttl_seconds":2,"request_path":"/files/reports/x","method":"GET"}'
+# → HTTP/1.1 200 OK，"replayed": true，expires_at / evaluated_at 与第 1 步完全一致；
+#   reserved 仍为 0（重放不新建预留、不刷新到期、不再占额度；响应中的 quota 是
+#   首次响应冻结的快照，以实时 GET 额度口径为准）
+
+# 4) 同键换内容（哪怕只是 ttl 不同）：一律 409
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST http://localhost:8000/api/v1/chains/rsv-replay-exp/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-exp-leaf","reservation_key":"rkey-exp-1",
+       "ttl_seconds":3,"request_path":"/files/reports/x","method":"GET"}'
+# → 409（detail 中 "reservation_status": "expired"）
+
+# 5) 份额已释放：令牌可用**新键**重新预留（这才是一笔新预留）
+curl -sS -i -X POST http://localhost:8000/api/v1/chains/rsv-replay-exp/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-exp-leaf","reservation_key":"rkey-exp-2",
+       "ttl_seconds":60,"request_path":"/files/reports/x","method":"GET"}'
+# → HTTP/1.1 201 Created，"replayed": false，新的 expires_at；reserved 重新变为 1
+```
+
+**重放二：携键核销成功后，核销键重放与预留键重放都回放首次结果**
+
+```bash
+# 准备：自定义助手生成 root -> service-a、末端主体 carol 的链（carol 全新、额度 1）
+build_carol_chain() {
+  PYTHONPATH=. CHAIN_ID="$1" python3 - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+chain_id = os.environ["CHAIN_ID"]
+root_secret = os.environ.get("ROOT_HMAC_SECRET", "dev-root-secret-change-me")
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+def token(tid, parent, iss, sub, path, methods, secret):
+    t = {"token_id": tid, "parent_id": parent, "chain_id": chain_id,
+         "issuer": iss, "subject": sub, "path_pattern": path, "methods": methods,
+         "not_before": nb, "not_after": na, "allow_ip": None, "signature": ""}
+    t["signature"] = compute_signature(t, secret)
+    return t
+lid = chain_id + "-leaf"
+print(json.dumps({"chain_id": chain_id, "tokens": [
+    token(lid+"-root", None, "root", "service-a", "/files/**", ["GET","POST"], root_secret),
+    token(lid, lid+"-root", "service-a", "carol", "/files/reports/x", ["GET"],
+          "demo-secret-service-a"),
+]}))
+PY
+}
+build_carol_chain rsv-replay-used > /tmp/rsv-replay-used.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/rsv-replay-used.json  # → 201
+curl -sS -X PUT http://localhost:8000/api/v1/subjects/carol/redemption-quota \
+  -H 'Content-Type: application/json' -d '{"limit": 1}'                   # → 200
+
+# 1) 预留一份
+curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-replay-used/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-used-leaf","reservation_key":"rkey-used-1",
+       "ttl_seconds":120,"request_path":"/files/reports/x","method":"GET"}'
+# → 201，"reserved": true
+
+# 2) 携带同一预留键、同访问内容核销：预留份额转为已用（记录保留为 consumed）
+curl -sS -X POST http://localhost:8000/api/v1/chains/rsv-replay-used/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-used-leaf","request_key":"access-used-1",
+       "request_path":"/files/reports/x","method":"GET",
+       "reservation_key":"rkey-used-1"}'
+# → 201，"redeemed": true，"quota": {"used": 1, "reserved": 0, ...}
+
+# 3) 核销键（request_key）重放：回放首次核销结果，不重复计已用
+curl -sS -i -X POST http://localhost:8000/api/v1/chains/rsv-replay-used/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-used-leaf","request_key":"access-used-1",
+       "request_path":"/files/reports/x","method":"GET",
+       "reservation_key":"rkey-used-1"}'
+# → HTTP/1.1 200 OK，"replayed": true，"redeemed": true，quota 与首次一致
+
+# 4) 预留键（reservation_key）重放：在预留接口回放首次预留结果，不重新占份额
+curl -sS -i -X POST http://localhost:8000/api/v1/chains/rsv-replay-used/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-used-leaf","reservation_key":"rkey-used-1",
+       "ttl_seconds":120,"request_path":"/files/reports/x","method":"GET"}'
+# → HTTP/1.1 200 OK，"replayed": true，expires_at 为第 1 步的首次到期时间；
+#   used / reserved 都不变（consumed 的份额不会被二次占用）
+
+# 5) 同键换内容（哪怕只是 ttl 不同）：409，detail 标明 "reservation_status":"consumed"
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST http://localhost:8000/api/v1/chains/rsv-replay-used/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"rsv-replay-used-leaf","reservation_key":"rkey-used-1",
+       "ttl_seconds":30,"request_path":"/files/reports/x","method":"GET"}'
+# → 409
+
+# 6) 已核销的预留键不能在别的令牌上再次核销占额：reservation_mismatch（不占键、不计已用）
+#    （需要一条末端未核销的新链；另取新主体或先调高 carol 额度后新建链即可）
+curl -sS -X POST http://localhost:8000/api/v1/chains/<其它未核销链>/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"<其它未核销末端>","request_key":"access-used-2",
+       "request_path":"/files/reports/x","method":"GET",
+       "reservation_key":"rkey-used-1"}'
+# → 200，"redeemed": false，"deny_reason": "reservation_mismatch"
 ```
 
 > 预留只在**主体已设额度**时可用（未设额度 = 不限额，预留返回
@@ -1989,7 +2155,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 │   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/密钥停用/链/撤销/影响清单/核销/主体核销额度/短时额度预留持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：209 个用例（端到端 API、原语单测、撤销审计、撤销影响清单、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结、失陷密钥停用、链末端 subject 跨链核销额度、短时额度预留）
+├── tests/             # pytest：213 个用例（端到端 API、原语单测、撤销审计、撤销影响清单、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结、失陷密钥停用、链末端 subject 跨链核销额度、短时额度预留及到期/核销后同键重放）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

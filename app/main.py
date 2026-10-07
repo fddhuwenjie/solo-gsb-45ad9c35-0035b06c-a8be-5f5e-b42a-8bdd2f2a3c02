@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 
 from .database import (
     compute_revocation_impacts,
-    delete_reservation,
     get_conn,
     get_db,
     get_principal_key_row,
@@ -42,6 +41,8 @@ from .database import (
     load_revocation_impacts,
     load_revocations,
     load_submission,
+    mark_reservation_consumed,
+    mark_reservation_expired,
     save_chain,
     snapshot_current_keys,
     token_exists,
@@ -120,10 +121,12 @@ app = FastAPI(
         "已用量含设置前的成功单链核销与会签参与侧，余额检查在既有授权 / 撤销 / "
         "停用判定全部通过后进行，余额不足不核销、不占键），以及为单链访问提供"
         "短时额度预留（1～300 秒：仅在主体已设额度、授权允许、令牌未核销且可用"
-        "额度充足时占一份，到期自动释放；普通核销 / 会签不得占用预留份额与被"
-        "预留的令牌，核销可携带预留键把预留份额转为已用）。"
+        "额度充足时占一份，到期自动释放份额与令牌占用，但成功预留的预留键与首次"
+        "响应永久保留——到期或核销后同键同内容仍重放首次结果、不再占额度，同键"
+        "换内容一律冲突；释放后的令牌可用新键预留）；普通核销 / 会签不得占用预留"
+        "份额与被预留的令牌，核销可携带预留键把预留份额转为已用）。"
     ),
-    version="1.8.0",
+    version="1.8.1",
     lifespan=lifespan,
 )
 
@@ -578,26 +581,31 @@ def reserve_quota(
     payload: ReserveRequest,
     conn: sqlite3.Connection = Depends(get_db),
 ) -> JSONResponse:
-    """为一次单链访问预留一份短时额度（有效秒数 1～300，到期自动释放）。
+    """为一次单链访问预留一份短时额度（有效秒数 1～300，到期释放份额与令牌占用）。
 
     判定时间以**服务端接收时刻**（UTC）实时重算现有验签 / 权限范围 / 撤销 /
     密钥停用状态；全部工作在同一 SQLite 事务（``BEGIN IMMEDIATE``）内：
 
     - 201 Created：目标确为链末端、判定允许、主体**已设额度**且可用量
       （``limit - used - reserved``）充足——占一份额度，返回 ``expires_at``；
-    - 200 OK：同 ``reservation_key`` 同内容重放（``replayed=true``，返回首次
-      结果与首次到期时间）；或预留失败（``reserved=false``，不占用
-      ``reservation_key``）：授权 / 撤销 / 停用判定拒绝（``decision="deny"``），
-      或判定允许但主体未设额度（``deny_reason="quota_unset"``）或可用量不足
+    - 200 OK：同 ``reservation_key`` 同内容**重放**（``replayed=true``，无条件
+      返回首次结果与**首次到期时间**——即使该预留已到期或已被核销转为已用，
+      也不重新判定、不刷新到期时间、不再占用额度）；或预留失败
+      （``reserved=false``，不占用 ``reservation_key``）：授权 / 撤销 / 停用判定
+      拒绝（``decision="deny"``），或判定允许但主体未设额度
+      （``deny_reason="quota_unset"``）或可用量不足
       （``deny_reason="quota_exhausted"``）；
-    - 409 Conflict：同 ``reservation_key`` 换内容；目标不是链末端；令牌此前已
-      核销；令牌已持有另一键的有效预留（同一令牌只能有一笔有效预留）；
+    - 409 Conflict：同 ``reservation_key`` 换内容（键历史在成功预留后永久保留，
+      预留已到期 / 已核销也不例外）；目标不是链末端；令牌此前已核销；令牌已
+      持有另一键的有效预留（同一令牌只能有一笔有效预留）；
     - 404 Not Found：链不存在，或令牌不属于该链；
     - 422：输入校验失败（如 ``ttl_seconds`` 超出 1～300）。
 
-    过期预留自动释放（不再占额度、不再占用令牌与预留键）；同一令牌在过期后
-    可重新预留。预留的份额只能由携带同一预留键、同访问内容的单链核销转为
-    已用——普通核销与会签既不得占用被预留的令牌，也不得占用预留的额度份额。
+    到期只释放**份额与令牌占用**（预留计数不再含该笔，同令牌可用**新键**重新
+    预留），预留记录与 ``reservation_key`` 历史保留：同键重试永远是首次结果的
+    重放，不会新建预留、刷新到期时间或再次占额度。预留的份额只能由携带同一
+    预留键、同访问内容的单链核销转为已用——普通核销与会签既不得占用被预留的
+    令牌，也不得占用预留的额度份额。
     """
     content_hash = canonical_reservation_hash(
         chain_id,
@@ -610,35 +618,42 @@ def reserve_quota(
         payload.ttl_seconds,
     )
 
-    # 立即取写锁：重放 / 冲突判定、过期释放与新预留“判定 + 占份”串行化
+    # 立即取写锁：重放 / 冲突判定、到期释放与新预留“判定 + 占份”串行化
     conn.execute("BEGIN IMMEDIATE")
     now = datetime.now(timezone.utc)
 
-    # 1) reservation_key 幂等 / 冲突（仅未过期的预留占用键；过期即释放）
+    # 1) reservation_key 幂等 / 冲突：成功预留的键永久关联首次内容与首次响应，
+    #    不因到期或核销而释放——无论记录处于 active / expired / consumed：
+    #    同内容一律回放首次结果（不重新判定、不刷新到期、不再占额度），
+    #    换内容一律 409。失败的预留从不落库，因此查不到即键仍可用。
     existing = load_reservation_by_key(conn, payload.reservation_key)
     if existing is not None:
         event, first_result_json = existing
-        if event.expires_at > now:
-            if event.content_sha256 != content_hash:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "detail": (
-                            f"reservation_key={payload.reservation_key!r} 已用于"
-                            "另一笔有效预留，同一 reservation_key 不得更换目标或内容"
-                        ),
-                        "reservation_key": payload.reservation_key,
-                        "existing_sha256": event.content_sha256,
-                        "received_sha256": content_hash,
-                    },
-                )
-            # 同键同内容且未过期：回放首次预留结果（到期时间与首次一致）
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content=json.loads(first_result_json) | {"replayed": True},
+        if event.content_sha256 != content_hash:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": (
+                        f"reservation_key={payload.reservation_key!r} 已关联一笔"
+                        "预留（首次内容已冻结），同一 reservation_key 不得更换"
+                        "目标或内容——即使该预留已到期或已核销"
+                    ),
+                    "reservation_key": payload.reservation_key,
+                    "existing_sha256": event.content_sha256,
+                    "received_sha256": content_hash,
+                    "reservation_status": event.status,
+                },
             )
-        # 已过期：自动释放（同键重试按一笔全新预留重新判定）
-        delete_reservation(conn, payload.reservation_key)
+        # 同键同内容：无条件回放首次预留结果（首次到期时间、首次额度口径，
+        # replayed=true；记录到期 / 已核销时同样回放，不重新占份）
+        if event.status == "active" and event.expires_at <= now:
+            # 到期在重放路径上也惰性翻转状态，使记录状态与其“已释放份额”的事实
+            # 一致（计数本就不含它；只改状态，不改变回放的首次结果）。
+            mark_reservation_expired(conn, event.reservation_key, now)
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=json.loads(first_result_json) | {"replayed": True},
+        )
 
     # 2) 链必须存在
     submission = load_submission(conn, chain_id)
@@ -689,26 +704,37 @@ def reserve_quota(
             },
         )
 
-    # 6) 同一令牌只能有一笔有效预留（过期预留自动释放后可重新预留）
-    token_reservation = load_reservation_for_token(conn, chain_id, payload.token_id)
+    # 6) 同一令牌只能有一笔有效预留：存在 active 行（未到期）即冲突。
+    #    到期只释放份额与令牌占用（记录保留为 expired 供同键重放）；本查询只
+    #    返回 active 且未到期的行，故查不到即表示令牌可被**新键**重新预留。
+    token_reservation = load_reservation_for_token(
+        conn, chain_id, payload.token_id, now
+    )
     if token_reservation is not None:
-        if token_reservation.expires_at > now:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "detail": (
-                        f"token_id={payload.token_id!r} 已持有有效预留 "
-                        f"（reservation_key={token_reservation.reservation_key!r}），"
-                        "同一令牌只能有一笔有效预留"
-                    ),
-                    "chain_id": chain_id,
-                    "token_id": payload.token_id,
-                    "existing_reservation_key": token_reservation.reservation_key,
-                    "expires_at": token_reservation.expires_at.isoformat(),
-                },
-            )
-        # 已过期：惰性释放，允许本请求重新预留
-        delete_reservation(conn, token_reservation.reservation_key)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"token_id={payload.token_id!r} 已持有有效预留 "
+                    f"（reservation_key={token_reservation.reservation_key!r}），"
+                    "同一令牌只能有一笔有效预留"
+                ),
+                "chain_id": chain_id,
+                "token_id": payload.token_id,
+                "existing_reservation_key": token_reservation.reservation_key,
+                "expires_at": token_reservation.expires_at.isoformat(),
+            },
+        )
+    # 该令牌若有“状态仍为 active 但已到期”的历史行（例如服务重启后从未触碰），
+    # 惰性翻转为 expired，使份额释放与状态记录保持一致（计数本就不含它）。
+    stale = conn.execute(
+        "SELECT reservation_key FROM reservations "
+        "WHERE chain_id = ? AND token_id = ? AND status = 'active' "
+        "AND expires_at <= ?",
+        (chain_id, payload.token_id, now.isoformat()),
+    ).fetchall()
+    for row in stale:
+        mark_reservation_expired(conn, row["reservation_key"], now)
 
     # 7) 以接收时刻重算现有验签 / 收窄 / 撤销 / 密钥停用 / 请求级权限
     evaluation = EvaluateRequest(
@@ -885,13 +911,16 @@ def redeem_chain(
     停用检查全部通过后才进行——这些检查拒绝时不查余额，响应也不带额度口径。
 
     **短时额度预留**：请求体可携带 ``reservation_key`` 使用事先预留的份额——
-    仅当该令牌持有同键、同访问内容（路径 / 方法 / 来源 IP / 请求体）且未过期
-    的有效预留时才核销，并在同一事务内把预留转为已用（预留行删除、已用量 +1，
-    可用量不变；此时不再重复检查余额，但仍重新检查验签 / 撤销 / 密钥停用 /
-    权限）。预留键不存在 / 已过期 / 内容不符（``deny_reason="reservation_mismatch"``）
-    或授权重新判定拒绝时，不核销、不占用 request_key、不计已用（预留仍保留至
-    到期）。不带预留键的普通核销**不得占用被预留的令牌**
-    （``deny_reason="token_reserved"``），其可用额度也不含他人预留的份额。
+    仅当该令牌持有同键、同访问内容（路径 / 方法 / 来源 IP / 请求体）的**有效
+    预留**（``status='active'`` 且未过期）时才核销，并在同一事务内把预留转为
+    已用（预留记录保留并置为 ``consumed``、已用量 +1，可用量不变；此时不再
+    重复检查余额，但仍重新检查验签 / 撤销 / 密钥停用 / 权限）。预留键不存在、
+    指向已到期 / 已核销的历史预留或内容不符
+    （``deny_reason="reservation_mismatch"``）或授权重新判定拒绝时，不核销、
+    不占用 request_key、不计已用（未过期的预留仍保留）。不带预留键的普通核销
+    **不得占用被预留的令牌**（``deny_reason="token_reserved"``），其可用额度也
+    不含他人预留的份额。到期或核销只释放份额与令牌占用：预留记录永久保留，
+    其 ``reservation_key`` 之后只能在预留接口重放首次结果，不能再次核销占额。
     """
     content_hash = canonical_redemption_hash(
         chain_id,
@@ -997,16 +1026,25 @@ def redeem_chain(
         )
 
     # 5.5) 短时额度预留解析（在授权判定之前；拒绝不核销、不占 request_key、不计已用）：
-    #      - 携带 reservation_key：该令牌必须持有同键、同访问内容且未过期的有效
-    #        预留，核销成功时在同一事务内把该预留转为已用；
+    #      - 携带 reservation_key：该令牌必须持有同键、同访问内容的**有效**预留
+    #        （status='active' 且未过期），核销成功时在同一事务内把预留转为已用
+    #        （状态置 consumed、记录保留；已用量随核销 +1，预留数 -1，可用量不变）；
     #      - 未携带：普通核销不得占用被他人预留的令牌。
+    #      到期 / 已核销只释放份额与令牌占用，预留记录永久保留供其自身同键重放。
     now = datetime.now(timezone.utc)
+    # 惰性释放：把该令牌“状态仍 active 但已到期”的历史行翻转为 expired
+    # （计数本就不含它；翻转后令牌对普通核销 / 新预留均视为无占用）。
+    for row in conn.execute(
+        "SELECT reservation_key FROM reservations "
+        "WHERE chain_id = ? AND token_id = ? AND status = 'active' "
+        "AND expires_at <= ?",
+        (chain_id, payload.token_id, now.isoformat()),
+    ).fetchall():
+        mark_reservation_expired(conn, row["reservation_key"], now)
     reservation_to_consume = None
-    active_reservation = load_reservation_for_token(conn, chain_id, payload.token_id)
-    if active_reservation is not None and active_reservation.expires_at <= now:
-        # 过期自动释放：不再占用令牌与额度份额
-        delete_reservation(conn, active_reservation.reservation_key)
-        active_reservation = None
+    active_reservation = load_reservation_for_token(
+        conn, chain_id, payload.token_id, now
+    )
     if payload.reservation_key is not None:
         if active_reservation is None or not _reservation_matches(
             active_reservation, payload
@@ -1179,10 +1217,10 @@ def redeem_chain(
     )
     try:
         insert_redemption(conn, event, initial_result_json)
-        # 使用预留份额的核销：同一事务内把预留转为已用（删除预留行，
-        # 已用量随核销记录 +1，预留数 -1，可用量不变）
+        # 使用预留份额的核销：同一事务内把预留转为已用（状态置 consumed、记录
+        # 保留供预留键重放；已用量随核销记录 +1，预留数 -1，可用量不变）
         if reservation_to_consume is not None:
-            delete_reservation(conn, reservation_to_consume.reservation_key)
+            mark_reservation_consumed(conn, reservation_to_consume.reservation_key)
     except sqlite3.IntegrityError as exc:
         # 并发下唯一约束兜底（request_key 或 chain_id+token_id 抢占）
         prior = load_redemption_for_token(conn, chain_id, payload.token_id)
@@ -1424,10 +1462,18 @@ def co_redeem(
     if all(decisions[s].decision == "allow" for s in ("primary", "review")):
         for side_name in ("primary", "review"):
             side_chain_id, side_token_id, _, side_tip = sides[side_name]
+            # 惰性释放该侧已到期（状态仍 active）的预留，再按当前时刻读取有效预留
+            for row in conn.execute(
+                "SELECT reservation_key FROM reservations "
+                "WHERE chain_id = ? AND token_id = ? AND status = 'active' "
+                "AND expires_at <= ?",
+                (side_chain_id, side_token_id, now.isoformat()),
+            ).fetchall():
+                mark_reservation_expired(conn, row["reservation_key"], now)
             reservation = load_reservation_for_token(
-                conn, side_chain_id, side_token_id
+                conn, side_chain_id, side_token_id, now
             )
-            if reservation is not None and reservation.expires_at > now:
+            if reservation is not None:
                 token_reserved_sides.append(side_name)
             status_ = get_quota_status(conn, side_tip.subject, now)
             # 未设置额度（不限额）：leg.quota 保持 None

@@ -1,6 +1,11 @@
-"""短时额度预留：预留 / 重放 / 冲突 / 过期释放、额度口径三分（已用 / 预留 / 可用）、
+"""短时额度预留：预留 / 重放 / 冲突 / 到期释放、额度口径三分（已用 / 预留 / 可用）、
 普通核销与会签不得占用预留份额或令牌、调低额度不得侵占预留、核销携带预留键
-匹配核销并转为已用、不匹配 / 过期 / 授权拒绝不占键不计已用、同键重试回放首次结果。"""
+匹配核销并转为已用、不匹配 / 过期 / 授权拒绝不占键不计已用、同键重试回放首次结果。
+
+成功预留的 reservation_key 永久关联首次内容与首次响应：到期或核销后同键同内容
+仍回放首次结果（200、replayed=true、首次到期时间，不重新占额度），同键换内容
+一律 409；到期 / 核销只释放份额与令牌占用（记录转为 expired / consumed 保留），
+释放后的令牌可用新键再次预留。"""
 from __future__ import annotations
 
 import itertools
@@ -143,6 +148,16 @@ def _reservation_exists(reservation_key: str) -> bool:
             (reservation_key,),
         ).fetchone()
         return row is not None
+
+
+def _reservation_status(reservation_key: str) -> str | None:
+    """预留记录的生命周期状态（active/expired/consumed）；无记录返回 None。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_key = ?",
+            (reservation_key,),
+        ).fetchone()
+        return row["status"] if row else None
 
 
 # --------------------------------------------------------------------------- #
@@ -353,7 +368,7 @@ def test_expired_reservation_releases_quota_token_and_key(client):
     assert _get_quota(client, s).json()["reserved"] == 1
 
 
-def test_expired_reservation_same_key_retried_as_new(client):
+def test_expired_reservation_releases_share_but_keeps_key_history(client):
     s = _subj("rsv")
     assert _set_quota(client, s, 1).status_code == 200
     cid, leaf = _chain_with_tip_subject(client, s)
@@ -362,12 +377,83 @@ def test_expired_reservation_same_key_retried_as_new(client):
 
     _expire_reservation("rsv-exp-key")
 
-    # 过期后同键同内容重试：按一笔全新预留处理（新的到期时间）
+    # 到期只释放份额与令牌占用（记录保留；状态在写路径触碰令牌时惰性翻转为 expired）
+    got = _get_quota(client, s).json()
+    assert got["reserved"] == 0 and got["available"] == 1
+
+    # 同键同内容重试：回放首次预留结果（200、replayed=true、首次到期时间），
+    # 不新建预留、不刷新到期时间、不再占用额度
     again = _reserve(client, cid, leaf, "rsv-exp-key", ttl=1)
-    assert again.status_code == 201
-    assert again.json()["replayed"] is False
-    assert again.json()["expires_at"] != first.json()["expires_at"]
+    assert again.status_code == 200
+    body = again.json()
+    assert body["replayed"] is True
+    assert body["reserved"] is True
+    assert body["expires_at"] == first.json()["expires_at"]
+    assert body["evaluated_at"] == first.json()["evaluated_at"]
+    assert _get_quota(client, s).json()["reserved"] == 0
+
+    # 同键换内容一律 409（即使已到期）
+    conflict = _reserve(client, cid, leaf, "rsv-exp-key", ttl=2)
+    assert conflict.status_code == 409
+
+    # 释放后的令牌可用**新键**重新预留（占一份新额度）；该写路径把旧记录
+    # 惰性翻转为 expired
+    fresh = _reserve(client, cid, leaf, "rsv-exp-key-2", ttl=60)
+    assert fresh.status_code == 201
+    assert fresh.json()["replayed"] is False
     assert _get_quota(client, s).json()["reserved"] == 1
+    # 两条历史记录都保留：同令牌至多一条 active（由部分唯一索引兜底）
+    assert _reservation_status("rsv-exp-key") == "expired"
+    assert _reservation_status("rsv-exp-key-2") == "active"
+
+
+def test_redeemed_reservation_key_replays_first_result(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    first = _reserve(client, cid, leaf, "rsv-consumed-key")
+    assert first.status_code == 201
+    assert _redeem(client, cid, leaf, "rsv-consumed-rk",
+                   reservation_key="rsv-consumed-key").status_code == 201
+    assert _reservation_status("rsv-consumed-key") == "consumed"
+
+    # 核销后同键同内容重放预留接口：返回首次结果（200、replayed=true），
+    # 不重新占额度（份额已在已用量中）
+    replay = _reserve(client, cid, leaf, "rsv-consumed-key")
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["replayed"] is True
+    assert body["reserved"] is True
+    assert body["expires_at"] == first.json()["expires_at"]
+    quota = _get_quota(client, s).json()
+    assert quota["used"] == 1 and quota["reserved"] == 0
+
+    # 同键换内容仍 409（reservation_status=consumed）
+    conflict = _reserve(client, cid, leaf, "rsv-consumed-key", method="POST")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reservation_status"] == "consumed"
+
+    # 已核销令牌不能再用任何键预留（既有“已核销”409 保持）
+    other = _reserve(client, cid, leaf, "rsv-after-consume")
+    assert other.status_code == 409
+    assert other.json()["detail"]["existing_request_key"] == "rsv-consumed-rk"
+
+
+def test_expired_reservation_key_can_redeem_with_new_key(client):
+    # 到期释放后：未核销的令牌可用新键预留并核销
+    s = _subj("rsv")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    assert _reserve(client, cid, leaf, "rsv-renew-old", ttl=1).status_code == 201
+    _expire_reservation("rsv-renew-old")
+
+    assert _reserve(client, cid, leaf, "rsv-renew-new", ttl=60).status_code == 201
+    resp = _redeem(client, cid, leaf, "rsv-renew-rk",
+                   reservation_key="rsv-renew-new")
+    assert resp.status_code == 201
+    assert _get_quota(client, s).json()["used"] == 1
+    assert _reservation_status("rsv-renew-old") == "expired"
+    assert _reservation_status("rsv-renew-new") == "consumed"
 
 
 # --------------------------------------------------------------------------- #
@@ -524,8 +610,8 @@ def test_redeem_with_matching_reservation_converts_to_used(client):
 
     got = _get_quota(client, s).json()
     assert got["used"] == 1 and got["reserved"] == 0
-    # 预留行已删除（转为已用）
-    assert _reservation_exists("rsv-use-1") is False
+    # 预留记录保留并转为 consumed（不再占份额，仅供同键重放首次结果）
+    assert _reservation_status("rsv-use-1") == "consumed"
 
     # 成功核销同键重试：返回首次结果（replayed=true，口径与首次一致）
     replay = _redeem(client, cid, leaf, "rsv-use-rk", reservation_key="rsv-use-1",
@@ -599,10 +685,38 @@ def test_redeem_with_expired_reservation_key_is_mismatch(client):
     assert resp.json()["redeemed"] is False
     assert resp.json()["deny_reason"] == "reservation_mismatch"
     assert _get_quota(client, s).json()["used"] == 0
+    # 历史记录保留为 expired（释放份额、不丢键历史）
+    assert _reservation_status("rsv-expired-use") == "expired"
 
     # 过期预留已释放：不带键的普通核销同键成功
     ok = _redeem(client, cid, leaf, "rsv-expired-rk")
     assert ok.status_code == 201
+
+
+def test_redeem_with_consumed_reservation_key_is_mismatch(client):
+    s = _subj("rsv")
+    assert _set_quota(client, s, 2).status_code == 200
+    c1, l1 = _chain_with_tip_subject(client, s)
+    c2, l2 = _chain_with_tip_subject(client, s)
+    assert _reserve(client, c1, l1, "rsv-done-key").status_code == 201
+    assert _redeem(client, c1, l1, "rsv-done-rk",
+                   reservation_key="rsv-done-key").status_code == 201
+    assert _reservation_status("rsv-done-key") == "consumed"
+
+    # 已核销的预留键不能在另一令牌上再次核销占额：reservation_mismatch
+    resp = _redeem(client, c2, l2, "rsv-done-rk-2",
+                   reservation_key="rsv-done-key")
+    assert resp.status_code == 200
+    assert resp.json()["redeemed"] is False
+    assert resp.json()["deny_reason"] == "reservation_mismatch"
+    assert _get_quota(client, s).json()["used"] == 1
+    assert _reservation_status("rsv-done-key") == "consumed"
+
+    # 未核销的另一令牌不受影响：新键预留 + 核销成功
+    assert _reserve(client, c2, l2, "rsv-done-key-2").status_code == 201
+    assert _redeem(client, c2, l2, "rsv-done-rk-3",
+                   reservation_key="rsv-done-key-2").status_code == 201
+    assert _get_quota(client, s).json()["used"] == 2
 
 
 def test_redeem_with_reservation_rechecks_authorization(client):
@@ -718,3 +832,50 @@ def test_concurrent_reserve_and_redeem_never_overshoot(client):
     got = _get_quota(client, s).json()
     assert got["used"] + got["reserved"] <= 1
     assert got["available"] == 1 - got["used"] - got["reserved"]
+
+
+def test_concurrent_expired_replay_and_new_reserve_never_double_occupy(client):
+    # 同一笔预留到期后：一线程用旧键重放（只回放、不占份），另一线程用新键预留；
+    # 两者并发也不得合计双占额度（重放永不占份；新预留占至多一份）
+    s = _subj("rsv-replay-conc")
+    assert _set_quota(client, s, 1).status_code == 200
+    cid, leaf = _chain_with_tip_subject(client, s)
+    assert _reserve(client, cid, leaf, "rsv-replay-conc-old", ttl=1).status_code == 201
+    _expire_reservation("rsv-replay-conc-old")
+    results: list[tuple[str, int, dict]] = []
+    barrier = threading.Barrier(2)
+
+    def replay_worker() -> None:
+        barrier.wait()
+        for _ in range(10):
+            resp = _reserve(client, cid, leaf, "rsv-replay-conc-old", ttl=1)
+            results.append(("replay", resp.status_code, resp.json()))
+
+    def new_reserve_worker() -> None:
+        barrier.wait()
+        resp = _reserve(client, cid, leaf, "rsv-replay-conc-new")
+        results.append(("new", resp.status_code, resp.json()))
+
+    threads = [threading.Thread(target=replay_worker),
+               threading.Thread(target=new_reserve_worker)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    replay_results = [r for r in results if r[0] == "replay"]
+    new_results = [r for r in results if r[0] == "new"]
+    # 旧键重放全部 200 + replayed=true
+    assert all(code == 200 and body["replayed"] is True
+               for _, code, body in replay_results)
+    # 新键：要么 201（抢到释放出的份额），要么 409（与重放交错时令牌被判占用——
+    # 但任何 201 至多一笔）
+    created = [r for r in new_results if r[1] == 201]
+    assert len(created) <= 1
+    got = _get_quota(client, s).json()
+    assert got["reserved"] <= 1
+    assert got["used"] + got["reserved"] <= 1
+    if created:
+        assert got["reserved"] == 1
+    # 旧记录无论是否被惰性翻转，同键重放始终回放首次结果
+    assert replay_results[0][2]["expires_at"]  # 首次到期时间存在

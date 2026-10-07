@@ -471,15 +471,20 @@ class ReserveRequest(RequestContext):
 
     token_id: str = Field(min_length=1, description="预留针对的令牌 id；必须为链末端")
     reservation_key: str = Field(
-        min_length=1, description="客户端幂等键；同键内容必须一致（仅有效预留占用）"
+        min_length=1, description="客户端幂等键；成功预留后永久关联首次内容（同键只能重放）"
     )
     ttl_seconds: int = Field(
-        ge=1, le=300, description="预留有效秒数（1～300）；到期自动释放"
+        ge=1, le=300, description="预留有效秒数（1～300）；到期释放份额但保留重放历史"
     )
 
 
 class ReservationEvent(BaseModel):
-    """短时额度预留记录（成功预留才落库；过期自动释放，核销成功后转为已用删除）。"""
+    """短时额度预留记录（成功预留才落库；记录永久保留，仅状态随生命周期流转）。
+
+    成功预留的 ``reservation_key`` 始终关联首次内容与首次响应：到期或核销都
+    **不删除记录**，状态单向流转——``active``（占额度 / 令牌）→ ``expired``
+    （到期释放，仅留重放历史）或 ``consumed``（被同键核销转为已用）。
+    """
 
     chain_id: str
     token_id: str
@@ -491,7 +496,14 @@ class ReservationEvent(BaseModel):
     request_body: Any
     content_sha256: str = Field(description="预留请求规范化内容指纹，用于重放/冲突判定")
     created_at: datetime = Field(description="预留落库时间（UTC）")
-    expires_at: datetime = Field(description="预留到期时间（UTC）；过期自动释放")
+    expires_at: datetime = Field(description="预留首次到期时间（UTC）；到期释放但记录保留")
+    status: Literal["active", "expired", "consumed"] = Field(
+        default="active",
+        description=(
+            "active=有效（占额度与令牌）；expired=已到期释放（保留历史供同键重放）；"
+            "consumed=已由同键核销转为已用（保留历史供同键重放）"
+        ),
+    )
 
 
 class ReservationResult(BaseModel):

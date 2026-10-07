@@ -180,10 +180,15 @@ CREATE TABLE IF NOT EXISTS redemption_quotas (
 );
 
 -- 短时额度预留：为一次单链访问预先占一份额度（有效秒数 1～300，到期自动释放）。
--- reservation_key 全局唯一（仅有效预留占用；过期 / 转为核销后键即释放）；
--- 同一链内同一令牌至多一行——即同一令牌只能有一笔有效预留（过期行由应用层
--- 惰性清除后允许新预留）。预留不单独记已用：核销成功时同事务删除预留行，
--- 由 redemptions 计入已用量，份额从“预留”转为“已用”，可用量不变。
+-- reservation_key 全局唯一且**永久占用**：成功预留一旦落库，其键始终关联首次内容
+-- 与首次响应——到期或转为核销都**保留记录**（不删除），同键只能重放首次结果，
+-- 同键换内容一律 409；因此同一令牌的历史预留可有多行（不同状态），但至多一行
+-- status='active'，由部分唯一索引 uq_active_reservation_per_token 兜底。
+-- status 状态机：active=有效（占额度、占令牌）；expired=已到期惰性释放（不占额度 /
+-- 令牌，仅留作同键重放历史）；consumed=已被同键核销转为已用（份额计入 redemptions）。
+-- 有效预留统计与同令牌占用判定只计入 status='active' 且 expires_at 未到的行；
+-- 新库直接使用下表，旧库 reservations（无 status 列、带 (chain_id, token_id) UNIQUE
+-- 全表约束）由 _migrate_reservations 在建表后整体搬迁并保留全部旧记录。
 CREATE TABLE IF NOT EXISTS reservations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_id        TEXT NOT NULL,
@@ -198,10 +203,23 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_at      TEXT NOT NULL,
     expires_at      TEXT NOT NULL,
     result_json     TEXT NOT NULL,
-    UNIQUE (chain_id, token_id),
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'expired', 'consumed')),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 """
+# 索引在 init_db 中、旧表迁移完成后创建（部分唯一索引依赖 status 列，不能直接
+# 写进 SCHEMA 在旧库上执行）：
+_RESERVATION_INDEXES = (
+    # 同一令牌至多一笔有效预留：部分唯一索引只约束 active 行，到期 / 已核销的
+    # 历史行不参与冲突，从而允许令牌在释放后用新键再次预留，同时保留全部历史。
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_active_reservation_per_token
+        ON reservations (chain_id, token_id) WHERE status = 'active'
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_reservations_token "
+    "ON reservations (chain_id, token_id)",
+)
 
 DEMO_PRINCIPALS = {
     "root": settings.root_hmac_secret,
@@ -250,8 +268,15 @@ def get_db() -> Iterator[sqlite3.Connection]:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    # 旧版 reservations 表无 status 列且带有 (chain_id, token_id) 全表唯一约束；
+    # 新表 DDL（含 status）在 SCHEMA 中，旧库执行 CREATE TABLE IF NOT EXISTS 时会
+    # 跳过建表，故先在脚本执行前把旧表改名，让 SCHEMA 按新结构建表，随后整体搬迁。
+    _stash_legacy_reservations(conn)
     conn.executescript(SCHEMA)
     _migrate_principals(conn)
+    _migrate_reservations(conn)
+    for stmt in _RESERVATION_INDEXES:
+        conn.execute(stmt)
     if settings.seed_demo_principals:
         conn.executemany(
             "INSERT OR IGNORE INTO principals (name, hmac_secret) VALUES (?, ?)",
@@ -259,6 +284,68 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     _backfill_key_tables(conn)
     conn.commit()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _stash_legacy_reservations(conn: sqlite3.Connection) -> None:
+    """把旧结构 reservations（无 status 列）改名为 _reservations_legacy。
+
+    改名发生在 SCHEMA 脚本执行前：随后 ``CREATE TABLE IF NOT EXISTS reservations``
+    会按新结构建表，旧记录由 :func:`_migrate_reservations` 原样搬迁（按搬迁时刻
+    区分 active / expired）。无表或已是新结构时为空操作。
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reservations'"
+    ).fetchone()
+    if exists is None:
+        return
+    if "status" in _table_columns(conn, "reservations"):
+        return
+    conn.execute("ALTER TABLE reservations RENAME TO _reservations_legacy")
+
+
+def _migrate_reservations(conn: sqlite3.Connection) -> None:
+    """把旧结构预留记录整体搬迁到新表并保留全部历史（幂等，可每次启动执行）。
+
+    - 搬迁时刻 ``expires_at`` 仍在未来的旧记录标记为 ``active``（继续占额度 / 令牌，
+      自然受新部分唯一索引保护——旧全表约束下同一令牌本就至多一行）；
+    - 已到期的旧记录标记为 ``expired``：释放额度与令牌占用，但记录与
+      ``reservation_key`` 历史保留，同键同内容仍可重放首次结果；
+    - 搬迁后删除旧表。记录只追加、搬迁只发生一次（旧表不存在即为空操作）。
+    """
+    legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='_reservations_legacy'"
+    ).fetchone()
+    if legacy is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    # 搬迁窗口内关闭外键强制：旧库若存在历史不一致（如链记录缺失）也不应阻塞
+    # 启动迁移；该 PRAGMA 为连接级设置，搬迁结束后立即恢复。
+    fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute(
+            """
+            INSERT INTO reservations (
+                chain_id, token_id, reservation_key, subject, request_path, method,
+                source_ip, request_body, content_sha256, created_at, expires_at,
+                result_json, status
+            )
+            SELECT chain_id, token_id, reservation_key, subject, request_path, method,
+                   source_ip, request_body, content_sha256, created_at, expires_at,
+                   result_json,
+                   CASE WHEN expires_at > ? THEN 'active' ELSE 'expired' END
+            FROM _reservations_legacy
+            """,
+            (now,),
+        )
+        conn.execute("DROP TABLE _reservations_legacy")
+    finally:
+        conn.execute(f"PRAGMA foreign_keys = {'ON' if fk_was_on else 'OFF'}")
 
 
 def _migrate_principals(conn: sqlite3.Connection) -> None:
@@ -1148,12 +1235,14 @@ def upsert_quota(
 
 
 # --------------------------------------------------------------------------- #
-# 短时额度预留（成功预留才落库；过期自动释放，核销成功后转为已用删除）
+# 短时额度预留（成功预留才落库；记录永久保留：到期转 expired、核销转 consumed）
 # --------------------------------------------------------------------------- #
 _RESERVATION_COLUMNS = (
     "chain_id, token_id, reservation_key, subject, request_path, method, "
-    "source_ip, request_body, content_sha256, created_at, expires_at"
+    "source_ip, request_body, content_sha256, created_at, expires_at, status"
 )
+# 有效预留的过滤条件：status='active' 且到期时间晚于判定时刻。
+_ACTIVE_RESERVATION_WHERE = "status = 'active' AND expires_at > ?"
 
 
 def load_reservation_by_key(
@@ -1161,8 +1250,9 @@ def load_reservation_by_key(
 ) -> tuple[ReservationEvent, str] | None:
     """返回（预留事件, 首次响应 JSON）；未见过该 reservation_key 时返回 None。
 
-    调用方须自行按 ``expires_at`` 判定预留是否仍有效：过期预留视为已释放
-    （键与令牌都不再被占用），由写事务内的调用方惰性清除。
+    成功预留的记录**永久保留**（active / expired / consumed 均可命中）：同键
+    请求是否为重放 / 冲突由调用方据返回记录的状态与内容判定，键历史不因到期或
+    核销而丢失。
     """
     row = conn.execute(
         f"SELECT {_RESERVATION_COLUMNS}, result_json FROM reservations "
@@ -1175,16 +1265,21 @@ def load_reservation_by_key(
 
 
 def load_reservation_for_token(
-    conn: sqlite3.Connection, chain_id: str, token_id: str
+    conn: sqlite3.Connection,
+    chain_id: str,
+    token_id: str,
+    at: datetime | None = None,
 ) -> ReservationEvent | None:
-    """该令牌当前的预留记录（同一令牌至多一行，即至多一笔有效预留）。
+    """该令牌当前的**有效预留**（``status='active'`` 且未到期）；无则返回 None。
 
-    不过滤过期：是否仍有效由调用方按 ``expires_at`` 判定（过期即视为释放）。
+    部分唯一索引保证同一令牌至多一行命中；已到期（status 尚未惰性翻转时按
+    ``expires_at`` 兜底过滤）与已核销的历史行不会占用令牌。
     """
+    moment = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     row = conn.execute(
         f"SELECT {_RESERVATION_COLUMNS} FROM reservations "
-        "WHERE chain_id = ? AND token_id = ?",
-        (chain_id, token_id),
+        f"WHERE chain_id = ? AND token_id = ? AND {_ACTIVE_RESERVATION_WHERE}",
+        (chain_id, token_id, moment.isoformat()),
     ).fetchone()
     return _reservation_from_row(row) if row else None
 
@@ -1192,12 +1287,12 @@ def load_reservation_for_token(
 def insert_reservation(
     conn: sqlite3.Connection, event: ReservationEvent, result_json: str
 ) -> None:
-    """追加一条预留记录；唯一约束冲突时抛 sqlite3.IntegrityError。"""
+    """追加一条有效预留记录（status='active'）；唯一约束冲突时抛 IntegrityError。"""
     conn.execute(
         "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
         "request_path, method, source_ip, request_body, content_sha256, "
-        "created_at, expires_at, result_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_at, expires_at, result_json, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
         (
             event.chain_id,
             event.token_id,
@@ -1215,21 +1310,44 @@ def insert_reservation(
     )
 
 
-def delete_reservation(conn: sqlite3.Connection, reservation_key: str) -> None:
-    """删除一条预留（过期惰性释放，或核销成功后把份额转为已用）。"""
+def mark_reservation_expired(
+    conn: sqlite3.Connection, reservation_key: str, at: datetime
+) -> None:
+    """把有效预留标记为到期释放（保留记录供同键重放；不再占额度与令牌）。
+
+    仅在持锁写事务内惰性调用；条件带 ``status='active'`` 保证状态机单向、幂等。
+    """
     conn.execute(
-        "DELETE FROM reservations WHERE reservation_key = ?", (reservation_key,)
+        "UPDATE reservations SET status='expired' "
+        "WHERE reservation_key = ? AND status='active' AND expires_at <= ?",
+        (reservation_key, at.astimezone(timezone.utc).isoformat()),
+    )
+
+
+def mark_reservation_consumed(conn: sqlite3.Connection, reservation_key: str) -> None:
+    """把有效预留标记为已核销（份额由 redemptions 计入已用；记录保留供键重放）。
+
+    与核销记录在同一事务内执行；条件带 ``status='active'`` 保证状态机单向、幂等。
+    """
+    conn.execute(
+        "UPDATE reservations SET status='consumed' "
+        "WHERE reservation_key = ? AND status='active'",
+        (reservation_key,),
     )
 
 
 def count_active_reservations(
     conn: sqlite3.Connection, subject: str, at: datetime | None = None
 ) -> int:
-    """某主体当前的有效预留数（``expires_at`` 晚于 ``at``；过期自动释放）。"""
+    """某主体当前的有效预留数（``status='active'`` 且 ``expires_at`` 晚于 ``at``）。
+
+    已到期（含尚未惰性翻转状态的行）与已核销预留均不计数——到期自动释放、
+    核销后份额转为已用；历史行保留但不再占额度。
+    """
     moment = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM reservations "
-        "WHERE subject = ? AND expires_at > ?",
+        f"WHERE subject = ? AND {_ACTIVE_RESERVATION_WHERE}",
         (subject, moment.isoformat()),
     ).fetchone()
     return int(row["n"])
@@ -1248,4 +1366,5 @@ def _reservation_from_row(row: sqlite3.Row) -> ReservationEvent:
         content_sha256=row["content_sha256"],
         created_at=datetime.fromisoformat(row["created_at"]),
         expires_at=datetime.fromisoformat(row["expires_at"]),
+        status=row["status"],
     )
